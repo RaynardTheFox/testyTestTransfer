@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,13 +19,20 @@ import (
 
 const (
 	projectID     = 4
-	parentSuiteID = 495
-	defaultHost   = "https://tms.transtelematica.ru"
+	parentSuiteID = 507
+	// Имя тест-плана. Обычно совпадает с именем сьюта, в который загружаем тесты (пример: "test").
+	defaultPlanName = "test"
+	defaultHost     = "https://tms.transtelematica.ru"
 
 	// API endpoints (from swagger in testyapi.json)
 	tokenObtainPath = "/api/token/obtain/"
 	suitesPath      = "/api/v1/suites/"
 	casesPath       = "/api/v1/cases/"
+	// Для тест-планов в твоём инстансе используется /api/v1/testplans/
+	plansPath    = "/api/v1/testplans/"
+	testsPath    = "/api/v1/tests/"
+	resultsPath  = "/api/v1/results/"
+	statusesPath = "/api/v1/statuses/"
 )
 
 type TestCaseData struct {
@@ -32,7 +40,16 @@ type TestCaseData struct {
 	Setup    string
 	Scenario string
 	Expected string
+	Status   string // PASS / FAIL / BLOCK (по Excel)
 	Section  string // suite delimiter name
+}
+
+// TestCaseStatus связывает созданный тест-кейс в Testy с его статусом из Excel.
+type TestCaseStatus struct {
+	CaseID int
+	Status string // PASS / FAIL / BLOCK
+	// Name — для логирования и возможной доп. диагностики.
+	Name string
 }
 
 type tokenObtainRequest struct {
@@ -83,6 +100,54 @@ type testCaseResponse struct {
 	Name string `json:"name"`
 }
 
+// Test Plan API structures
+// Структура соответствует TestPlanInputV1 из swagger:
+// обязательные поля: name, started_at, due_date, project.
+type createTestPlanRequest struct {
+	Name        string    `json:"name"`
+	Project     int       `json:"project"`
+	StartedAt   time.Time `json:"started_at"`
+	DueDate     time.Time `json:"due_date"`
+	Description string    `json:"description,omitempty"`
+}
+
+// Минимальный ответ по тест-плану (совместим с TestPlanMinV1, интересует только id и name).
+type testPlanResponse struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+// Tests API structures (связка план + кейс).
+type createTestRequest struct {
+	Project int `json:"project"`
+	CaseID  int `json:"case"`
+	PlanID  int `json:"plan"`
+}
+
+type testResponse struct {
+	ID int `json:"id"`
+}
+
+// Results API structures (результаты прогона тестов).
+type createResultRequest struct {
+	StatusID int `json:"status"`
+	TestID   int `json:"test"`
+}
+
+// ResultStatus описывает возможный статус результата (PASSED/FAILED/BLOCKED и т.п.).
+type resultStatus struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+type addCaseToPlanRequest struct {
+	CaseID int `json:"case_id"`
+}
+
+type setCaseResultRequest struct {
+	Status string `json:"status"`
+}
+
 func main() {
 	fmt.Println("=== Testy Test Case Importer ===")
 
@@ -90,6 +155,8 @@ func main() {
 		excelFile = flag.String("file", "table-utmanualtc.xlsx", "Имя Excel-файла (.xlsx) в текущей директории")
 		sheetName = flag.String("sheet", "", "Имя листа (если пусто — первый лист)")
 		host      = flag.String("host", defaultHost, "Host Testy (например https://tms.transtelematica.ru)")
+		planIDFlg = flag.Int("plan", 0, "ID существующего тест-плана, в который добавлять тесты и результаты (если 0 — этап плана пропускается)")
+		suiteIDFg = flag.Int("suite", parentSuiteID, "ID родительского suite, под которым будут создаваться разделы/кейсы")
 	)
 	flag.Parse()
 
@@ -136,10 +203,15 @@ func main() {
 
 	// Cache section name -> created child suite ID
 	suiteIDsBySection := map[string]int{}
-	currentSuiteID := parentSuiteID
+	rootSuiteID := *suiteIDFg
+	currentSuiteID := rootSuiteID
 	currentSection := ""
 
 	createdCount := 0
+	passCount := 0
+	failCount := 0
+	blockCount := 0
+	var createdCases []TestCaseStatus
 
 	for i, tc := range testCases {
 		// Handle section delimiter: create/reuse child suite under parentSuiteID.
@@ -151,7 +223,7 @@ func main() {
 				currentSuiteID = suiteID
 				fmt.Printf("[INFO] Используем существующий child suite ID: %d\n", currentSuiteID)
 			} else {
-				suiteID, err := createSuite(client, *host, parentSuiteID, currentSection, token, scheme)
+				suiteID, err := createSuite(client, *host, rootSuiteID, currentSection, token, scheme)
 				if err != nil {
 					fmt.Printf("[ERROR] Не удалось создать child suite '%s': %v\n", currentSection, err)
 					os.Exit(1)
@@ -167,13 +239,43 @@ func main() {
 		// (But in typical file structure, the first section appears right after header row.)
 		targetSuiteID := currentSuiteID
 
-		created, err := createTestCase(client, *host, targetSuiteID, tc, token, scheme)
+		// Сначала пробуем найти уже существующий тест-кейс с таким именем в текущем suite.
+		existingID, err := findExistingTestCaseID(client, *host, projectID, targetSuiteID, tc.Name, token, scheme)
+		var created testCaseResponse
 		if err != nil {
-			fmt.Printf("[ERROR] Не удалось создать тест-кейс (строка #%d, name=%q): %v\n", i+1, tc.Name, err)
+			fmt.Printf("[ERROR] Ошибка при поиске существующего тест-кейса (строка #%d, name=%q): %v\n", i+1, tc.Name, err)
 			os.Exit(1)
 		}
+		if existingID > 0 {
+			// Кейс уже существует — не создаём новый, просто логируем и используем существующий ID.
+			fmt.Printf("[INFO] Тест-кейс уже существует: %q (ID: %d) — пропускаем создание, используем существующий\n", tc.Name, existingID)
+			created = testCaseResponse{ID: existingID, Name: tc.Name}
+		} else {
+			// Кейс не найден — создаём новый.
+			created, err = createTestCase(client, *host, targetSuiteID, tc, token, scheme)
+			if err != nil {
+				fmt.Printf("[ERROR] Не удалось создать тест-кейс (строка #%d, name=%q): %v\n", i+1, tc.Name, err)
+				os.Exit(1)
+			}
+			fmt.Printf("[INFO] Создан тест-кейс: %q (ID: %d) [Статус: %s]\n", created.Name, created.ID, tc.Status)
+		}
 
-		fmt.Printf("[INFO] Создан тест-кейс: %q (ID: %d)\n", created.Name, created.ID)
+		// Сохраняем соответствие ID тест-кейса и статуса для последующего создания Test Plan.
+		createdCases = append(createdCases, TestCaseStatus{
+			CaseID: created.ID,
+			Status: tc.Status,
+			Name:   created.Name,
+		})
+
+		// Считаем статистику по статусам.
+		switch tc.Status {
+		case "PASS":
+			passCount++
+		case "FAIL":
+			failCount++
+		case "BLOCK":
+			blockCount++
+		}
 
 		createdCount++
 		// Подтверждение после первого и далее после каждого десятого созданного кейса.
@@ -186,7 +288,71 @@ func main() {
 		}
 	}
 
-	fmt.Println("[OK] Импорт завершён.")
+	if createdCount == 0 {
+		fmt.Println("[INFO] Тест-кейсы не были созданы.")
+		fmt.Println("[OK] Импорт завершён.")
+		return
+	}
+
+	fmt.Printf("[INFO] Обработка Excel завершена. Создано тест-кейсов: %d (PASS=%d, FAIL=%d, BLOCK=%d)\n",
+		createdCount, passCount, failCount, blockCount)
+
+	// Если пользователь не передал ID плана — завершаем на создании кейсов.
+	if *planIDFlg == 0 {
+		fmt.Println("[INFO] ID тест-плана не передан (-plan), этап добавления тестов в план и проставления результатов пропускается.")
+		fmt.Println("[OK] Импорт завершён.")
+		return
+	}
+
+	planID := *planIDFlg
+	fmt.Printf("[INFO] Используем существующий тест-план ID: %d\n", planID)
+
+	// Подтверждение перед формированием тестов и результатов.
+	if !confirmPlanCreation() {
+		fmt.Println("[INFO] Пользователь отменил формирование тестов и результатов по плану.")
+		fmt.Println("[OK] Импорт завершён.")
+		return
+	}
+
+	// Загружаем возможные статусы результатов и строим мапу name -> id.
+	statusIDs, err := fetchResultStatusIDs(client, *host, projectID, token, scheme)
+	if err != nil {
+		fmt.Printf("[ERROR] Не удалось получить список статусов результатов: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("[INFO] Создаю тесты (Tests) для плана и устанавливаю результаты...")
+	for _, cs := range createdCases {
+		// 1. Создаём Test (связка план + кейс).
+		testObj, err := createTestForCase(client, *host, projectID, planID, cs.CaseID, token, scheme)
+		if err != nil {
+			fmt.Printf("[ERROR] Не удалось создать Test для кейса %d в плане %d: %v\n", cs.CaseID, planID, err)
+			continue
+		}
+
+		// 2. Находим ID статуса по имени.
+		statusName := mapStatusToResult(cs.Status)
+		if statusName == "" {
+			fmt.Printf("[WARN] Невалидный статус %q для кейса %d — результат не устанавливается\n", cs.Status, cs.CaseID)
+			continue
+		}
+		statusID, ok := statusIDs[statusName]
+		if !ok {
+			fmt.Printf("[WARN] В системе не найден статус %q (кейc %d) — результат не устанавливается\n", statusName, cs.CaseID)
+			continue
+		}
+
+		// 3. Создаём результат для теста.
+		if err := createResultForTest(client, *host, statusID, testObj.ID, token, scheme); err != nil {
+			fmt.Printf("[ERROR] Не удалось установить результат для теста %d (case=%d, status=%s): %v\n", testObj.ID, cs.CaseID, statusName, err)
+			continue
+		}
+
+		fmt.Printf("[OK] Результат для кейса %d (test=%d): %s\n", cs.CaseID, testObj.ID, statusName)
+	}
+
+	fmt.Printf("[INFO] Итоговая статистика: PASS=%d, FAIL=%d, BLOCK=%d\n", passCount, failCount, blockCount)
+	fmt.Println("[OK] Импорт и формирование тест-плана завершены.")
 }
 
 // getAuthCredentials запрашивает у пользователя логин/пароль через stdin.
@@ -302,7 +468,8 @@ func readExcelFile(path, sheetName string) ([]TestCaseData, error) {
 	headerRow := -1
 	colIndex := map[string]int{} // normalized header -> 1-based col index
 
-	required := []string{"id", "название", "предусловие", "шаги", "ожидаемый результат"}
+	// Обязательные заголовки, включая новую колонку "Статус".
+	required := []string{"id", "название", "предусловие", "шаги", "ожидаемый результат", "статус"}
 	for r := 1; r <= min(20, len(rows)); r++ {
 		// Check row values for required headers
 		headerMap := map[string]int{}
@@ -343,6 +510,8 @@ func readExcelFile(path, sheetName string) ([]TestCaseData, error) {
 
 	currentSection := ""
 	lastRow := len(rows)
+	// Начальный статус по умолчанию — PASS.
+	lastValidStatus := "PASS"
 	for r := headerRow + 1; r <= lastRow; r++ {
 		// Section delimiter by merged row
 		if sec, ok := mergedRowName[r]; ok {
@@ -356,6 +525,7 @@ func readExcelFile(path, sheetName string) ([]TestCaseData, error) {
 		setup := get("предусловие", r)
 		scenario := get("шаги", r)
 		expected := get("ожидаемый результат", r)
+		rawStatus := get("статус", r)
 		// id := get("id", r) // not used
 
 		// If row looks like a "section" (sometimes it's not captured as merged):
@@ -378,11 +548,16 @@ func readExcelFile(path, sheetName string) ([]TestCaseData, error) {
 			return nil, fmt.Errorf("строка %d: отсутствует 'Название' у тест-кейса", r)
 		}
 
+		// Парсим статус с учётом наследования и значений по умолчанию.
+		status, updatedLast := parseStatus(rawStatus, lastValidStatus)
+		lastValidStatus = updatedLast
+
 		out = append(out, TestCaseData{
 			Name:     name,
 			Setup:    setup,
 			Scenario: scenario,
 			Expected: expected,
+			Status:   status,
 			Section:  currentSection,
 		})
 	}
@@ -501,6 +676,19 @@ func confirmContinuation() bool {
 	return ans == "yes"
 }
 
+// confirmPlanCreation запрашивает подтверждение перед созданием тест-плана
+// и/или проставлением результатов выполнения.
+func confirmPlanCreation() bool {
+	in := bufio.NewReader(os.Stdin)
+	fmt.Print("Создать тест-план и проставить результаты? (yes/no): ")
+	ans, err := readLine(in)
+	if err != nil {
+		return false
+	}
+	ans = strings.ToLower(strings.TrimSpace(ans))
+	return ans == "yes"
+}
+
 func addAuth(req *http.Request, token string, scheme string) {
 	s := strings.TrimSpace(scheme)
 	if s == "" {
@@ -522,6 +710,248 @@ func normalizeHeader(s string) string {
 	s = strings.ReplaceAll(s, "\u00a0", " ") // non-breaking space
 	s = strings.Join(strings.Fields(s), " ")
 	return s
+}
+
+// parseStatus нормализует значение статуса из Excel (PASS/FAIL/BLOCK),
+// поддерживает:
+// - регистронезависимый ввод;
+// - значение по умолчанию PASS;
+// - наследование последнего валидного статуса (особенно BLOCK);
+// - игнорирование невалидных значений.
+func parseStatus(raw string, lastValid string) (normalized string, newLast string) {
+	raw = strings.ToUpper(strings.TrimSpace(raw))
+
+	switch raw {
+	case "PASS", "FAIL", "BLOCK":
+		// Явно указанный валидный статус — обновляем lastValid.
+		return raw, raw
+	case "":
+		// Пустая ячейка — используем последний валидный или PASS по умолчанию.
+		if strings.TrimSpace(lastValid) == "" {
+			return "PASS", "PASS"
+		}
+		return lastValid, lastValid
+	default:
+		// Невалидное значение — игнорируем, используем последний валидный
+		// или PASS по умолчанию.
+		if strings.TrimSpace(lastValid) == "" {
+			return "PASS", "PASS"
+		}
+		return lastValid, lastValid
+	}
+}
+
+// mapStatusToResult конвертирует Excel-статус (PASS/FAIL/BLOCK)
+// в статус результата Testy (PASSED/FAILED/BLOCKED).
+func mapStatusToResult(status string) string {
+	switch strings.ToUpper(strings.TrimSpace(status)) {
+	case "PASS":
+		return "PASSED"
+	case "FAIL":
+		return "FAILED"
+	case "BLOCK":
+		return "BLOCKED"
+	default:
+		return ""
+	}
+}
+
+// fetchResultStatusIDs получает список возможных ResultStatus для проекта
+// и строит мапу name -> id.
+func fetchResultStatusIDs(client *http.Client, host string, projectID int, token string, scheme string) (map[string]int, error) {
+	// В некоторых инсталляциях требуется указать project как query-параметр.
+	url := fmt.Sprintf("%s%s?project=%d", strings.TrimRight(host, "/"), statusesPath, projectID)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	addAuth(req, token, scheme)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("HTTP %d при получении статусов результатов: %s", resp.StatusCode, truncate(string(body), 1200))
+	}
+
+	var statuses []resultStatus
+	if err := json.Unmarshal(body, &statuses); err != nil {
+		return nil, fmt.Errorf("не удалось распарсить ответ статусов результатов: %v; body=%s", err, truncate(string(body), 1200))
+	}
+
+	out := make(map[string]int, len(statuses))
+	for _, st := range statuses {
+		name := strings.ToUpper(strings.TrimSpace(st.Name))
+		if name != "" {
+			out[name] = st.ID
+		}
+	}
+	return out, nil
+}
+
+// createTestForCase создаёт сущность Test (привязка case + plan).
+func createTestForCase(client *http.Client, host string, projectID, planID, caseID int, token string, scheme string) (testResponse, error) {
+	// Сначала пробуем найти уже существующий Test для пары (plan, case).
+	if existing, err := findExistingTest(client, host, projectID, planID, caseID, token, scheme); err == nil && existing.ID > 0 {
+		return existing, nil
+	}
+
+	reqBody, _ := json.Marshal(createTestRequest{
+		Project: projectID,
+		CaseID:  caseID,
+		PlanID:  planID,
+	})
+
+	url := strings.TrimRight(host, "/") + testsPath
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(reqBody))
+	if err != nil {
+		return testResponse{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	addAuth(req, token, scheme)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return testResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return testResponse{}, fmt.Errorf("HTTP %d при создании Test: %s", resp.StatusCode, truncate(string(body), 1200))
+	}
+
+	var out testResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return testResponse{}, fmt.Errorf("не удалось распарсить ответ Test: %v; body=%s", err, truncate(string(body), 1200))
+	}
+	if out.ID == 0 {
+		return testResponse{}, fmt.Errorf("API не вернул id Test; body=%s", truncate(string(body), 1200))
+	}
+	return out, nil
+}
+
+// findExistingTestCaseID ищет тест-кейс по имени в рамках проекта и suite.
+// Возвращает ID найденного кейса или 0, если не найден.
+func findExistingTestCaseID(client *http.Client, host string, projectID, suiteID int, name string, token string, scheme string) (int, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return 0, nil
+	}
+
+	base := strings.TrimRight(host, "/") + casesPath
+	values := url.Values{}
+	values.Set("project", fmt.Sprintf("%d", projectID))
+	values.Set("suite", fmt.Sprintf("%d", suiteID))
+	values.Set("name", name)
+	fullURL := base + "?" + values.Encode()
+
+	req, err := http.NewRequest(http.MethodGet, fullURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	addAuth(req, token, scheme)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, fmt.Errorf("HTTP %d при поиске кейса: %s", resp.StatusCode, truncate(string(body), 800))
+	}
+
+	// Ответ cases-list — пагинация с полем results.
+	var list struct {
+		Results []struct {
+			ID   int    `json:"id"`
+			Name string `json:"name"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(body, &list); err != nil {
+		return 0, fmt.Errorf("не удалось распарсить ответ поиска кейса: %v; body=%s", err, truncate(string(body), 800))
+	}
+	if len(list.Results) == 0 {
+		return 0, nil
+	}
+	// Берём первый совпавший ID.
+	return list.Results[0].ID, nil
+}
+
+// findExistingTest ищет Test по проекту, плану и кейсу.
+// Возвращает существующий Test или testResponse{ID:0}, если не найден.
+func findExistingTest(client *http.Client, host string, projectID, planID, caseID int, token string, scheme string) (testResponse, error) {
+	base := strings.TrimRight(host, "/") + testsPath
+	values := url.Values{}
+	values.Set("project", fmt.Sprintf("%d", projectID))
+	values.Set("plan", fmt.Sprintf("%d", planID))
+	values.Set("case", fmt.Sprintf("%d", caseID))
+	fullURL := base + "?" + values.Encode()
+
+	req, err := http.NewRequest(http.MethodGet, fullURL, nil)
+	if err != nil {
+		return testResponse{}, err
+	}
+	addAuth(req, token, scheme)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return testResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return testResponse{}, fmt.Errorf("HTTP %d при поиске Test: %s", resp.StatusCode, truncate(string(body), 800))
+	}
+
+	var list struct {
+		Results []struct {
+			ID int `json:"id"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(body, &list); err != nil {
+		return testResponse{}, fmt.Errorf("не удалось распарсить ответ поиска Test: %v; body=%s", err, truncate(string(body), 800))
+	}
+	if len(list.Results) == 0 {
+		return testResponse{}, nil
+	}
+	return testResponse{ID: list.Results[0].ID}, nil
+}
+
+// createResultForTest создаёт результат выполнения теста.
+func createResultForTest(client *http.Client, host string, statusID, testID int, token string, scheme string) error {
+	reqBody, _ := json.Marshal(createResultRequest{
+		StatusID: statusID,
+		TestID:   testID,
+	})
+
+	url := strings.TrimRight(host, "/") + resultsPath
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(reqBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	addAuth(req, token, scheme)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP %d при создании результата: %s", resp.StatusCode, truncate(string(body), 1200))
+	}
+
+	return nil
 }
 
 func mustCell(col, row int) string {
