@@ -20,6 +20,10 @@ import (
 const (
 	projectID     = 4
 	parentSuiteID = 507
+	// Для автоматического режима (без -plan и -suite) —
+	// родительские объекты, под которыми создаются дочерние suite/plan.
+	autoParentSuiteID = 3
+	autoParentPlanID  = 3
 	// Имя тест-плана. Обычно совпадает с именем сьюта, в который загружаем тесты (пример: "test").
 	defaultPlanName = "test"
 	defaultHost     = "https://tms.transtelematica.ru"
@@ -109,6 +113,7 @@ type createTestPlanRequest struct {
 	StartedAt   time.Time `json:"started_at"`
 	DueDate     time.Time `json:"due_date"`
 	Description string    `json:"description,omitempty"`
+	Parent      *int      `json:"parent,omitempty"`
 }
 
 // Минимальный ответ по тест-плану (совместим с TestPlanMinV1, интересует только id и name).
@@ -200,12 +205,45 @@ func main() {
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
+	// Автоматический режим с созданием дочерних suite/plan:
+	// активируется, когда пользователь не передал -plan и -suite,
+	// т.е. ID плана = 0 и ID suite равен значению по умолчанию.
+	autoMode := (*planIDFlg == 0 && *suiteIDFg == parentSuiteID)
 
 	// Cache section name -> created child suite ID
 	suiteIDsBySection := map[string]int{}
 	rootSuiteID := *suiteIDFg
 	currentSuiteID := rootSuiteID
 	currentSection := ""
+
+	// Итоговый ID плана, который будет использован далее.
+	effectivePlanID := *planIDFlg
+
+	if autoMode {
+		baseName := filepath.Base(absPath)
+		suiteAndPlanName := strings.TrimSuffix(baseName, filepath.Ext(baseName))
+
+		fmt.Printf("[INFO] Автоматический режим: создаю корневой child suite и тест-план для файла %q\n", suiteAndPlanName)
+
+		// 1. Создаём дочерний suite под фиксированным родителем autoParentSuiteID.
+		newRootSuiteID, err := createSuite(client, *host, autoParentSuiteID, suiteAndPlanName, token, scheme)
+		if err != nil {
+			fmt.Printf("[ERROR] Не удалось создать корневой child suite '%s' под parent=%d: %v\n", suiteAndPlanName, autoParentSuiteID, err)
+			os.Exit(1)
+		}
+		rootSuiteID = newRootSuiteID
+		currentSuiteID = rootSuiteID
+		fmt.Printf("[INFO] Создан корневой child suite: ID=%d, name=%q, parent=%d\n", rootSuiteID, suiteAndPlanName, autoParentSuiteID)
+
+		// 2. Создаём дочерний тест-план под фиксированным родителем autoParentPlanID.
+		newPlan, err := createTestPlan(client, *host, suiteAndPlanName, autoParentPlanID, token, scheme)
+		if err != nil {
+			fmt.Printf("[ERROR] Не удалось создать child test plan '%s' под parent=%d: %v\n", suiteAndPlanName, autoParentPlanID, err)
+			os.Exit(1)
+		}
+		effectivePlanID = newPlan.ID
+		fmt.Printf("[INFO] Создан child test plan: ID=%d, name=%q, parent=%d\n", newPlan.ID, newPlan.Name, autoParentPlanID)
+	}
 
 	createdCount := 0
 	passCount := 0
@@ -297,15 +335,15 @@ func main() {
 	fmt.Printf("[INFO] Обработка Excel завершена. Создано тест-кейсов: %d (PASS=%d, FAIL=%d, BLOCK=%d)\n",
 		createdCount, passCount, failCount, blockCount)
 
-	// Если пользователь не передал ID плана — завершаем на создании кейсов.
-	if *planIDFlg == 0 {
-		fmt.Println("[INFO] ID тест-плана не передан (-plan), этап добавления тестов в план и проставления результатов пропускается.")
+	// Если итоговый ID плана всё ещё 0 — завершаем на создании кейсов.
+	if effectivePlanID == 0 {
+		fmt.Println("[INFO] ID тест-плана не передан (-plan) и не был создан автоматически, этап добавления тестов в план и проставления результатов пропускается.")
 		fmt.Println("[OK] Импорт завершён.")
 		return
 	}
 
-	planID := *planIDFlg
-	fmt.Printf("[INFO] Используем существующий тест-план ID: %d\n", planID)
+	planID := effectivePlanID
+	fmt.Printf("[INFO] Используем тест-план ID: %d\n", planID)
 
 	// Подтверждение перед формированием тестов и результатов.
 	if !confirmPlanCreation() {
@@ -662,6 +700,60 @@ func createTestCase(client *http.Client, host string, suiteID int, tc TestCaseDa
 		out.Name = tc.Name
 	}
 	return out, nil
+}
+
+// createTestPlan создаёт тест-план (в т.ч. дочерний) и возвращает его ID/Name.
+func createTestPlan(client *http.Client, host, name string, parentPlanID int, token string, scheme string) (testPlanResponse, error) {
+	now := time.Now()
+
+	reqObj := createTestPlanRequest{
+		Name:        name,
+		Project:     projectID,
+		StartedAt:   now,
+		DueDate:     now.Add(30 * 24 * time.Hour),
+		Description: "",
+	}
+	if parentPlanID > 0 {
+		reqObj.Parent = &parentPlanID
+	}
+
+	reqBody, _ := json.Marshal(reqObj)
+
+	url := strings.TrimRight(host, "/") + plansPath
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(reqBody))
+	if err != nil {
+		return testPlanResponse{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	addAuth(req, token, scheme)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return testPlanResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return testPlanResponse{}, fmt.Errorf("HTTP %d при создании тест-плана: %s", resp.StatusCode, truncate(string(body), 2000))
+	}
+
+	// В твоём инстансе API /testplans/ возвращает массив объектов, а не один объект.
+	// Поддержим оба варианта: одиночный объект и массив, берём первый элемент.
+	var single testPlanResponse
+	if err := json.Unmarshal(body, &single); err == nil && single.ID != 0 {
+		return single, nil
+	}
+
+	var list []testPlanResponse
+	if err := json.Unmarshal(body, &list); err != nil {
+		return testPlanResponse{}, fmt.Errorf("не удалось распарсить ответ тест-плана ни как объект, ни как массив: %v; body=%s", err, truncate(string(body), 2000))
+	}
+	if len(list) == 0 || list[0].ID == 0 {
+		return testPlanResponse{}, fmt.Errorf("API не вернул id тест-плана; body=%s", truncate(string(body), 2000))
+	}
+
+	return list[0], nil
 }
 
 // confirmContinuation спрашивает пользователя, всё ли корректно, после каждого созданного тест-кейса.
